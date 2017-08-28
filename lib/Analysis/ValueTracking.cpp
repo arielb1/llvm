@@ -445,29 +445,6 @@ static bool isEphemeralValueOf(const Instruction *I, const Value *E) {
   return false;
 }
 
-// Is this an intrinsic that cannot be speculated but also cannot trap?
-static bool isAssumeLikeIntrinsic(const Instruction *I) {
-  if (const CallInst *CI = dyn_cast<CallInst>(I))
-    if (Function *F = CI->getCalledFunction())
-      switch (F->getIntrinsicID()) {
-      default: break;
-      // FIXME: This list is repeated from NoTTI::getIntrinsicCost.
-      case Intrinsic::assume:
-      case Intrinsic::dbg_declare:
-      case Intrinsic::dbg_value:
-      case Intrinsic::invariant_start:
-      case Intrinsic::invariant_end:
-      case Intrinsic::lifetime_start:
-      case Intrinsic::lifetime_end:
-      case Intrinsic::objectsize:
-      case Intrinsic::ptr_annotation:
-      case Intrinsic::var_annotation:
-        return true;
-      }
-
-  return false;
-}
-
 bool llvm::isValidAssumeForContext(const Instruction *Inv,
                                    const Instruction *CxtI,
                                    const DominatorTree *DT) {
@@ -505,12 +482,18 @@ bool llvm::isValidAssumeForContext(const Instruction *Inv,
         return true;
   }
 
+  // Don't let an assume affect itself - this would cause the problems
+  // `isEphemeralValueOf` is trying to prevent, and it would also make
+  // the loop below go out of bounds.
+  if (Inv == CxtI)
+    return false;
+
   // The context comes first, but they're both in the same block. Make sure
   // there is nothing in between that might interrupt the control flow.
   for (BasicBlock::const_iterator I =
          std::next(BasicBlock::const_iterator(CxtI)), IE(Inv);
        I != IE; ++I)
-    if (!isSafeToSpeculativelyExecute(&*I) && !isAssumeLikeIntrinsic(&*I))
+    if (!isGuaranteedToTransferExecutionToSuccessor(&*I))
       return false;
 
   return !isEphemeralValueOf(Inv, CxtI);
@@ -3528,6 +3511,8 @@ OverflowResult llvm::computeOverflowForUnsignedAdd(const Value *LHS,
   return OverflowResult::MayOverflow;
 }
 
+
+
 static OverflowResult computeOverflowForSignedAdd(const Value *LHS,
                                                   const Value *RHS,
                                                   const AddOperator *Add,
@@ -3706,8 +3691,12 @@ bool llvm::isGuaranteedToTransferExecutionToSuccessor(const Instruction *I) {
 
     // FIXME: This isn't aggressive enough; a call which only writes to a global
     // is guaranteed to return.
+
     return CS.onlyReadsMemory() || CS.onlyAccessesArgMemory() ||
-           match(I, m_Intrinsic<Intrinsic::assume>());
+           match(I, m_Intrinsic<Intrinsic::assume>()) ||
+           match(I, m_Intrinsic<Intrinsic::annotation>()) ||
+           match(I, m_Intrinsic<Intrinsic::ptr_annotation>()) ||
+           match(I, m_Intrinsic<Intrinsic::var_annotation>());
   }
 
   // Other instructions return normally.
